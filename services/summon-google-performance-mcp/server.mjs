@@ -1138,6 +1138,10 @@ async function bigqueryQuery(args, req) {
   if (!/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/|\()*(SELECT|WITH)\b/i.test(sql)) {
     throw new Error("Only a single SELECT statement is allowed (start the query with SELECT or WITH).");
   }
+  const sqlWithoutComments = sql.replace(/--[^\n]*/g, "").replace(/\/\*[\s\S]*?\*\//g, "");
+  if (/;\s*\S/.test(sqlWithoutComments)) {
+    throw new Error("Only one statement is allowed; remove everything after the first semicolon.");
+  }
   const maxRows = clampNumber(args.max_rows, 1, 1000, 200);
   const queryProject =
     client.bigqueryQueryProject ||
