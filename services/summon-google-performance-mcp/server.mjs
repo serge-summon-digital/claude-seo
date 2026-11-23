@@ -13,6 +13,20 @@ const GOOGLE_ADS_BASE_URL = `https://googleads.googleapis.com/${GOOGLE_ADS_API_V
 const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GA4_BASE_URL = "https://analyticsdata.googleapis.com/v1beta";
 const GSC_BASE_URL = "https://searchconsole.googleapis.com/webmasters/v3";
+const BIGQUERY_BASE_URL = "https://bigquery.googleapis.com/bigquery/v2";
+// Hard cap on bytes one BigQuery query may scan. Default 5 GB (about $0.03 on-demand).
+const BIGQUERY_MAX_BYTES = parsePositiveInt(
+  process.env.BIGQUERY_MAX_BYTES_BILLED,
+  5_000_000_000,
+);
+const BIGQUERY_USD_PER_TIB = 6.25;
+const BIGQUERY_MAX_RESPONSE_CHARS = 200_000;
+const BIGQUERY_GET_ENDPOINTS = new Set([
+  "bigquery_list_tables",
+  "bigquery_get_table",
+  "bigquery_query_results",
+  "bigquery_job_get",
+]);
 
 const staticBearerEnabled = Boolean(process.env.MCP_AUTH_TOKEN);
 const oauthEnabled = Boolean(
@@ -412,6 +426,70 @@ const tools = [
       limit: numberSchema(1, 5000, 500),
     }),
   },
+  {
+    name: "bigquery_list_tables",
+    description:
+      "List tables in an allowlisted BigQuery dataset. Date-sharded tables (for example GA4 export events_YYYYMMDD) are grouped with their first and last date, so check lastDate to see how fresh the data is.",
+    inputSchema: {
+      type: "object",
+      required: ["client_key"],
+      properties: {
+        client_key: {
+          type: "string",
+          description: "Client key from CLIENT_ALLOWLIST_JSON.",
+        },
+        dataset: {
+          type: "string",
+          description:
+            "Allowed dataset as project.dataset. Defaults to the client's first BigQuery dataset.",
+        },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bigquery_table_schema",
+    description:
+      "Read the columns (including nested RECORD fields), row count, size and description of one table in an allowlisted BigQuery dataset. For sharded tables pass one shard, e.g. events_20260630.",
+    inputSchema: {
+      type: "object",
+      required: ["client_key", "table"],
+      properties: {
+        client_key: {
+          type: "string",
+          description: "Client key from CLIENT_ALLOWLIST_JSON.",
+        },
+        dataset: {
+          type: "string",
+          description:
+            "Allowed dataset as project.dataset. Defaults to the client's first BigQuery dataset.",
+        },
+        table: { type: "string", description: "Table ID, without dataset." },
+      },
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "bigquery_query",
+    description:
+      "Run one read-only GoogleSQL SELECT against the client's allowlisted BigQuery datasets. The query is dry-run first and refused unless it is a single SELECT, reads only allowlisted datasets, and scans no more than the byte cap (default 5 GB). Always use fully qualified table names (`project.dataset.table`). For GA4 exports, query `events_*` with `WHERE _TABLE_SUFFIX BETWEEN 'YYYYMMDD' AND 'YYYYMMDD'`, select only needed columns, and aggregate in SQL instead of returning raw events. Returns at most max_rows rows.",
+    inputSchema: {
+      type: "object",
+      required: ["client_key", "sql"],
+      properties: {
+        client_key: {
+          type: "string",
+          description: "Client key from CLIENT_ALLOWLIST_JSON.",
+        },
+        sql: {
+          type: "string",
+          description: "A single GoogleSQL SELECT statement.",
+        },
+        max_rows: numberSchema(1, 1000, 200),
+      },
+      additionalProperties: false,
+    },
+  },
 ];
 
 async function handleRpcRequest(request, req) {
@@ -427,7 +505,7 @@ async function handleRpcRequest(request, req) {
         capabilities: { tools: {} },
         serverInfo: {
           name: SERVICE_NAME,
-          version: "0.1.0",
+          version: "0.2.0",
         },
       });
     }
@@ -495,6 +573,12 @@ async function callTool(name, args, req) {
       return googleAdsLandingPages(args, req);
     case "ppc_to_seo_opportunities":
       return ppcToSeoOpportunities(args, req);
+    case "bigquery_list_tables":
+      return bigqueryListTables(args, req);
+    case "bigquery_table_schema":
+      return bigqueryTableSchema(args, req);
+    case "bigquery_query":
+      return bigqueryQuery(args, req);
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -508,6 +592,7 @@ function listClients() {
       ga4Properties: maskArray(client.ga4Properties),
       gscSites: client.gscSites || [],
       googleAdsCustomerIds: maskArray(client.googleAdsCustomerIds),
+      bigqueryDatasets: client.bigqueryDatasets || [],
       brandTerms: client.brandTerms || [],
     })),
   };
@@ -921,6 +1006,428 @@ function summarisePpcToSeo(rows, options) {
     }));
 }
 
+async function bigqueryListTables(args, req) {
+  const context = getBigQueryContext(args);
+  const cacheKey = stableCacheKey("google:bq:tables", context.dataset);
+  const tables = await withCachedJson(
+    cacheKey,
+    READONLY_SAFETY.todayCacheTtlMs,
+    async () => {
+      const collected = [];
+      let pageToken;
+      do {
+        const query = new URLSearchParams({ maxResults: "1000" });
+        if (pageToken) query.set("pageToken", pageToken);
+        const page = await bigQueryRequest(
+          "bigquery_list_tables",
+          context.projectId,
+          `/projects/${encodeURIComponent(context.projectId)}/datasets/${encodeURIComponent(context.datasetId)}/tables?${query}`,
+        );
+        collected.push(
+          ...(page.tables || []).map((table) => ({
+            tableId: table.tableReference?.tableId || "",
+            type: table.type || null,
+          })),
+        );
+        pageToken = page.nextPageToken;
+      } while (pageToken && collected.length < 10_000);
+      return collected;
+    },
+  );
+
+  const sharded = new Map();
+  const single = [];
+  for (const table of tables) {
+    const match = /^(.*_)(\d{8})$/.exec(table.tableId);
+    if (match) {
+      const group = sharded.get(match[1]) || { dates: [], type: table.type };
+      group.dates.push(match[2]);
+      sharded.set(match[1], group);
+    } else {
+      single.push({ table: table.tableId, type: table.type });
+    }
+  }
+
+  const shardedTables = [...sharded.entries()].map(([prefix, group]) => {
+    const dates = group.dates.sort();
+    return {
+      prefix,
+      wildcard: `${context.dataset}.${prefix}*`,
+      shards: dates.length,
+      firstDate: dates[0],
+      lastDate: dates[dates.length - 1],
+      type: group.type,
+    };
+  });
+
+  audit(req, "bigquery_list_tables", args, {
+    dataset: context.dataset,
+    tables: tables.length,
+  });
+
+  return {
+    source: "BigQuery",
+    client: context.clientKey,
+    dataset: context.dataset,
+    totalTables: tables.length,
+    shardedTables,
+    tables: single,
+  };
+}
+
+async function bigqueryTableSchema(args, req) {
+  const context = getBigQueryContext(args);
+  const tableId = requireString(args.table, "table");
+  if (!/^[A-Za-z0-9_$-]{1,1024}$/.test(tableId)) {
+    throw new Error("table must be a plain table ID without dataset or project.");
+  }
+
+  const cacheKey = stableCacheKey("google:bq:table", context.dataset, tableId);
+  const table = await withCachedJson(
+    cacheKey,
+    READONLY_SAFETY.todayCacheTtlMs,
+    () =>
+      bigQueryRequest(
+        "bigquery_get_table",
+        context.projectId,
+        `/projects/${encodeURIComponent(context.projectId)}/datasets/${encodeURIComponent(context.datasetId)}/tables/${encodeURIComponent(tableId)}`,
+      ),
+  );
+  const fields = flattenBigQueryFields(table.schema?.fields || []);
+
+  audit(req, "bigquery_table_schema", args, {
+    dataset: context.dataset,
+    table: tableId,
+    fields: fields.length,
+  });
+
+  return {
+    source: "BigQuery",
+    client: context.clientKey,
+    table: `${context.dataset}.${tableId}`,
+    type: table.type || null,
+    description: table.description || null,
+    numRows: table.numRows ? Number(table.numRows) : null,
+    sizeMb: table.numBytes ? Math.round(Number(table.numBytes) / 1e5) / 10 : null,
+    created: table.creationTime
+      ? new Date(Number(table.creationTime)).toISOString()
+      : null,
+    lastModified: table.lastModifiedTime
+      ? new Date(Number(table.lastModifiedTime)).toISOString()
+      : null,
+    timePartitioning: table.timePartitioning || null,
+    fieldsTruncated: fields.length > 1000,
+    fields: fields.slice(0, 1000),
+  };
+}
+
+async function bigqueryQuery(args, req) {
+  const { clientKey, client } = requireClient(args.client_key);
+  if (!client.bigqueryDatasets?.length) {
+    throw new Error("No BigQuery source is configured for this client.");
+  }
+  const sql = requireString(args.sql, "sql");
+  if (sql.length > 20_000) {
+    throw new Error("sql is too long (max 20,000 characters).");
+  }
+  if (/information_schema/i.test(sql)) {
+    throw new Error(
+      "INFORMATION_SCHEMA queries are not allowed. Use bigquery_list_tables or bigquery_table_schema.",
+    );
+  }
+  if (!/^(?:\s|--[^\n]*\n|\/\*[\s\S]*?\*\/|\()*(SELECT|WITH)\b/i.test(sql)) {
+    throw new Error("Only a single SELECT statement is allowed (start the query with SELECT or WITH).");
+  }
+  const maxRows = clampNumber(args.max_rows, 1, 1000, 200);
+  const queryProject =
+    client.bigqueryQueryProject ||
+    parseDatasetRef(client.bigqueryDatasets[0]).projectId;
+  const allowed = new Set(client.bigqueryDatasets);
+
+  const cacheKey = stableCacheKey("google:bq:query", clientKey, queryProject, sql, maxRows);
+  const outcome = await withCachedJson(
+    cacheKey,
+    READONLY_SAFETY.todayCacheTtlMs,
+    async () => {
+      // 1. Dry run (jobs.query, works with the bigquery.readonly scope): statement type and
+      //    bytes are checked before anything runs.
+      const dryRun = await bigQueryRequest(
+        "bigquery_dry_run",
+        queryProject,
+        `/projects/${encodeURIComponent(queryProject)}/queries`,
+        {
+          method: "POST",
+          body: { query: sql, useLegacySql: false, dryRun: true },
+        },
+      );
+      if (dryRun.statementType !== "SELECT") {
+        throw new Error(
+          `Only a single SELECT statement is allowed (got ${dryRun.statementType || "unknown"}).`,
+        );
+      }
+      const estimatedBytes = Number(dryRun.totalBytesProcessed || 0);
+      if (estimatedBytes > BIGQUERY_MAX_BYTES) {
+        throw new Error(
+          `Query would scan ${formatGb(estimatedBytes)} GB, above the ${formatGb(BIGQUERY_MAX_BYTES)} GB limit. Narrow the _TABLE_SUFFIX date range or select fewer columns.`,
+        );
+      }
+
+      // 2. Real run; BigQuery enforces the same byte cap again via maximumBytesBilled.
+      let result = await bigQueryRequest(
+        "bigquery_query_run",
+        queryProject,
+        `/projects/${encodeURIComponent(queryProject)}/queries`,
+        {
+          method: "POST",
+          body: {
+            query: sql,
+            useLegacySql: false,
+            maxResults: maxRows,
+            timeoutMs: 20_000,
+            maximumBytesBilled: String(BIGQUERY_MAX_BYTES),
+            // Off so the finished job always reports referencedTables (checked below).
+            useQueryCache: false,
+            formatOptions: { useInt64Timestamp: true },
+            labels: { source: "summon-google-performance-mcp" },
+          },
+        },
+      );
+      for (let attempt = 0; !result.jobComplete && attempt < 8; attempt += 1) {
+        const jobRef = result.jobReference || {};
+        const query = new URLSearchParams({
+          maxResults: String(maxRows),
+          timeoutMs: "20000",
+          "formatOptions.useInt64Timestamp": "true",
+        });
+        if (jobRef.location) query.set("location", jobRef.location);
+        result = await bigQueryRequest(
+          "bigquery_query_results",
+          queryProject,
+          `/projects/${encodeURIComponent(jobRef.projectId || queryProject)}/queries/${encodeURIComponent(jobRef.jobId)}?${query}`,
+        );
+      }
+      if (!result.jobComplete) {
+        throw new Error("BigQuery query did not finish within about 3 minutes.");
+      }
+
+      // 3. The dry run cannot list tables under the read-only scope, so check what the
+      //    finished job actually read and withhold the rows if it touched anything else.
+      const jobRef = result.jobReference || {};
+      const jobQuery = jobRef.location
+        ? `?location=${encodeURIComponent(jobRef.location)}`
+        : "";
+      const job = await bigQueryRequest(
+        "bigquery_job_get",
+        queryProject,
+        `/projects/${encodeURIComponent(jobRef.projectId || queryProject)}/jobs/${encodeURIComponent(jobRef.jobId)}${jobQuery}`,
+      );
+      const referenced = [
+        ...new Set(
+          (job.statistics?.query?.referencedTables || []).map(
+            (ref) => `${ref.projectId}.${ref.datasetId}`,
+          ),
+        ),
+      ];
+      if (!referenced.length) {
+        throw new Error("The query must read from an allowlisted BigQuery dataset.");
+      }
+      const blocked = referenced.filter((ref) => !allowed.has(ref));
+      if (blocked.length) {
+        throw new Error(
+          `Query reads datasets that are not allowlisted for client ${clientKey}: ${blocked.join(", ")}. Results withheld.`,
+        );
+      }
+
+      return {
+        referenced,
+        estimatedBytes,
+        fields: result.schema?.fields || [],
+        rows: result.rows || [],
+        totalRows: Number(result.totalRows || 0),
+        totalBytesProcessed: result.totalBytesProcessed
+          ? Number(result.totalBytesProcessed)
+          : null,
+        totalBytesBilled: result.totalBytesBilled
+          ? Number(result.totalBytesBilled)
+          : null,
+        cacheHit: Boolean(result.cacheHit),
+      };
+    },
+  );
+
+  let rows = bigQueryRowsToObjects(outcome.fields, outcome.rows);
+  let truncatedForSize = false;
+  while (rows.length > 1 && JSON.stringify(rows).length > BIGQUERY_MAX_RESPONSE_CHARS) {
+    rows = rows.slice(0, Math.floor(rows.length / 2));
+    truncatedForSize = true;
+  }
+  const totalRows = outcome.totalRows || rows.length;
+  const bytesProcessed = outcome.totalBytesProcessed ?? outcome.estimatedBytes;
+
+  audit(req, "bigquery_query", args, {
+    referenced: outcome.referenced,
+    bytesProcessed,
+    rows: rows.length,
+  });
+
+  return {
+    source: "BigQuery",
+    client: clientKey,
+    datasets: outcome.referenced,
+    bytesProcessed,
+    bytesCharged: outcome.totalBytesBilled,
+    cacheHit: outcome.cacheHit,
+    estimatedCostUsd:
+      Math.round((bytesProcessed / 2 ** 40) * BIGQUERY_USD_PER_TIB * 10_000) / 10_000,
+    totalRows,
+    returnedRows: rows.length,
+    truncated: rows.length < totalRows,
+    truncatedForSize,
+    columns: outcome.fields.map((field) => ({
+      name: field.name,
+      type: field.type,
+      mode: field.mode || "NULLABLE",
+    })),
+    rows,
+  };
+}
+
+async function bigQueryRequest(endpointKey, projectId, path, options = {}) {
+  const contextKey = `google:bq:${projectId}`;
+  const token = await getGoogleAccessToken();
+  const response = await safeFetch(
+    endpointKey,
+    `${BIGQUERY_BASE_URL}${path}`,
+    {
+      method: options.method || "GET",
+      headers: {
+        authorization: `Bearer ${token}`,
+        ...(options.body ? { "content-type": "application/json" } : {}),
+      },
+      body: options.body ? JSON.stringify(options.body) : undefined,
+    },
+    { contextKey },
+  );
+  return parseGoogleResponse(response, {
+    circuitKey: contextKey,
+    ignoreClientErrors: true,
+  });
+}
+
+function isBigQueryDryRunBody(body) {
+  const parsed = parseJsonBody(body);
+  return Boolean(
+    parsed &&
+      parsed.dryRun === true &&
+      parsed.useLegacySql === false &&
+      Object.keys(parsed).every((key) => ["query", "useLegacySql", "dryRun"].includes(key)),
+  );
+}
+
+function isCappedBigQueryQueryBody(body) {
+  const parsed = parseJsonBody(body);
+  return Boolean(
+    parsed &&
+      parsed.useLegacySql === false &&
+      parsed.dryRun === undefined &&
+      Number(parsed.maximumBytesBilled) > 0 &&
+      Number(parsed.maximumBytesBilled) <= BIGQUERY_MAX_BYTES,
+  );
+}
+
+function parseJsonBody(body) {
+  try {
+    return JSON.parse(bodyToString(body));
+  } catch {
+    return null;
+  }
+}
+
+function getBigQueryContext(args) {
+  const { clientKey, client } = requireClient(args.client_key);
+  const dataset = String(args.dataset || firstAllowed(client.bigqueryDatasets, "BigQuery"));
+  if (!client.bigqueryDatasets?.includes(dataset)) {
+    throw new Error(`BigQuery dataset is not allowlisted for client: ${clientKey}`);
+  }
+  return { clientKey, client, dataset, ...parseDatasetRef(dataset) };
+}
+
+function parseDatasetRef(ref) {
+  const value = String(ref || "");
+  const split = value.lastIndexOf(".");
+  const projectId = value.slice(0, split);
+  const datasetId = value.slice(split + 1);
+  if (
+    split < 1 ||
+    !/^[a-z0-9.:-]{4,100}$/.test(projectId) ||
+    !/^[A-Za-z0-9_]{1,1024}$/.test(datasetId)
+  ) {
+    throw new Error(`BigQuery dataset must be "project.dataset", got: ${value}`);
+  }
+  return { projectId, datasetId };
+}
+
+function flattenBigQueryFields(fields, prefix = "") {
+  return fields.flatMap((field) => {
+    const name = `${prefix}${field.name}`;
+    const entry = {
+      name,
+      type: field.type,
+      mode: field.mode || "NULLABLE",
+      ...(field.description ? { description: field.description } : {}),
+    };
+    return [entry, ...flattenBigQueryFields(field.fields || [], `${name}.`)];
+  });
+}
+
+function bigQueryRowsToObjects(fields, rows) {
+  return rows.map((row) => bigQueryRecord(fields, row));
+}
+
+function bigQueryRecord(fields, row) {
+  const record = {};
+  fields.forEach((field, index) => {
+    record[field.name] = bigQueryValue(field, row?.f?.[index]?.v);
+  });
+  return record;
+}
+
+function bigQueryValue(field, value) {
+  if (value === null || value === undefined) return null;
+  if (field.mode === "REPEATED") {
+    return (Array.isArray(value) ? value : []).map((item) =>
+      bigQueryValue({ ...field, mode: "NULLABLE" }, item?.v),
+    );
+  }
+  switch (field.type) {
+    case "RECORD":
+    case "STRUCT":
+      return bigQueryRecord(field.fields || [], value);
+    case "INTEGER":
+    case "INT64": {
+      const number = Number(value);
+      return Number.isSafeInteger(number) ? number : value;
+    }
+    case "FLOAT":
+    case "FLOAT64":
+    case "NUMERIC":
+    case "BIGNUMERIC":
+      return Number(value);
+    case "BOOLEAN":
+    case "BOOL":
+      return value === true || value === "true";
+    case "TIMESTAMP":
+      // With useInt64Timestamp the value is microseconds since epoch.
+      return new Date(Number(value) / 1000).toISOString();
+    default:
+      return value;
+  }
+}
+
+function formatGb(bytes) {
+  return (bytes / 1e9).toFixed(2);
+}
+
 async function runGa4Report(propertyId, body) {
   const contextKey = `google:ga4:${propertyId}`;
   const cacheKey = stableCacheKey("google:ga4", propertyId, body);
@@ -1072,7 +1579,9 @@ async function parseGoogleResponse(response, meta = {}) {
       data?.error?.message ||
       data?.error_description ||
       `${response.status} ${response.statusText}`;
-    handleVendorStopState(response.status, message, data, meta);
+    if (!(meta.ignoreClientErrors && response.status === 400)) {
+      handleVendorStopState(response.status, message, data, meta);
+    }
     throw new Error(message);
   }
 
@@ -1221,8 +1730,9 @@ async function executeSafeFetchAttempt(requestUrl, options) {
 
 function assertAllowedOutboundRequest(endpointKey, requestUrl, options) {
   const method = String(options.method || "GET").toUpperCase();
-  if (method !== "POST") {
-    throw new Error(`Blocked non-POST outbound request: ${endpointKey}`);
+  const expectedMethod = BIGQUERY_GET_ENDPOINTS.has(endpointKey) ? "GET" : "POST";
+  if (method !== expectedMethod) {
+    throw new Error(`Blocked unexpected ${method} outbound request: ${endpointKey}`);
   }
 
   assertNoDangerousOutboundIntent(endpointKey, requestUrl, options);
@@ -1240,7 +1750,27 @@ function assertAllowedOutboundRequest(endpointKey, requestUrl, options) {
       /^\/webmasters\/v3\/sites\/[^/]+\/searchAnalytics\/query$/.test(path)) ||
     (endpointKey === "google_ads_search_stream" &&
       host === "googleads.googleapis.com" &&
-      /^\/v\d+\/customers\/\d+\/googleAds:searchStream$/.test(path));
+      /^\/v\d+\/customers\/\d+\/googleAds:searchStream$/.test(path)) ||
+    (endpointKey === "bigquery_list_tables" &&
+      host === "bigquery.googleapis.com" &&
+      /^\/bigquery\/v2\/projects\/[^/]+\/datasets\/[^/]+\/tables$/.test(path)) ||
+    (endpointKey === "bigquery_get_table" &&
+      host === "bigquery.googleapis.com" &&
+      /^\/bigquery\/v2\/projects\/[^/]+\/datasets\/[^/]+\/tables\/[^/]+$/.test(path)) ||
+    (endpointKey === "bigquery_dry_run" &&
+      host === "bigquery.googleapis.com" &&
+      /^\/bigquery\/v2\/projects\/[^/]+\/queries$/.test(path) &&
+      isBigQueryDryRunBody(options.body)) ||
+    (endpointKey === "bigquery_job_get" &&
+      host === "bigquery.googleapis.com" &&
+      /^\/bigquery\/v2\/projects\/[^/]+\/jobs\/[^/]+$/.test(path)) ||
+    (endpointKey === "bigquery_query_run" &&
+      host === "bigquery.googleapis.com" &&
+      /^\/bigquery\/v2\/projects\/[^/]+\/queries$/.test(path) &&
+      isCappedBigQueryQueryBody(options.body)) ||
+    (endpointKey === "bigquery_query_results" &&
+      host === "bigquery.googleapis.com" &&
+      /^\/bigquery\/v2\/projects\/[^/]+\/queries\/[^/]+$/.test(path));
 
   if (!allowed) {
     throw new Error(
@@ -1252,7 +1782,10 @@ function assertAllowedOutboundRequest(endpointKey, requestUrl, options) {
 }
 
 function assertNoDangerousOutboundIntent(endpointKey, requestUrl, options) {
-  const body = endpointKey.includes("oauth") ? "" : bodyToString(options.body);
+  const body =
+    endpointKey.includes("oauth") || endpointKey.startsWith("bigquery_")
+      ? ""
+      : bodyToString(options.body);
   const subject = `${requestUrl.toString()} ${body}`.toLowerCase();
   const blocked = READONLY_DENYLIST.find((term) =>
     subject.includes(term.toLowerCase()),
@@ -1606,6 +2139,13 @@ function parseClientAllowlist(raw) {
             stripCustomerId,
           ),
           brandTerms: asStringArray(value.brandTerms),
+          bigqueryDatasets: asStringArray(value.bigqueryDatasets).map((ref) => {
+            parseDatasetRef(ref);
+            return ref;
+          }),
+          bigqueryQueryProject: value.bigqueryQueryProject
+            ? String(value.bigqueryQueryProject).trim()
+            : null,
         },
       ]),
     );

@@ -17,6 +17,7 @@ const allowedApiHosts = new Set([
   "analyticsdata.googleapis.com",
   "searchconsole.googleapis.com",
   "googleads.googleapis.com",
+  "bigquery.googleapis.com",
   "ads.microsoft.com",
   "login.microsoftonline.com",
   "reporting.api.bingads.microsoft.com",

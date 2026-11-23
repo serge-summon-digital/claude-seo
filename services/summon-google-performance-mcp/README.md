@@ -103,3 +103,17 @@ npm run check
 - Store Google refresh tokens in hosting secrets, not in this repository.
 - Add a persistent encrypted token store before onboarding many client Google
   accounts.
+
+## BigQuery (v0.2.0)
+
+Tools: `bigquery_list_tables`, `bigquery_table_schema`, `bigquery_query`. Configure per client
+with `"bigqueryDatasets": ["project.dataset"]` (optional `"bigqueryQueryProject"`). The Google
+refresh token needs `https://www.googleapis.com/auth/bigquery.readonly`; re-issue it with
+`node scripts/oauth/update-google-performance-token.mjs`, which only saves to Railway after
+checking the new login still reaches every allowlisted GA4 property, GSC site and the MCC.
+
+`bigquery_query` safety: SQL must start with SELECT/WITH; a `jobs.query` dry run must report
+`statementType = SELECT` and at most `BIGQUERY_MAX_BYTES_BILLED` (default 5 GB) scanned; the
+real run sets `maximumBytesBilled`; the finished job's `referencedTables` (via `jobs.get`) must
+all be in the client's datasets or the rows are withheld. INFORMATION_SCHEMA is blocked.
+Rows are capped at 1,000 and about 200 KB.
